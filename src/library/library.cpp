@@ -31,6 +31,7 @@
 #include "library/trackset/playlistfeature.h"
 #include "library/trackset/setlogfeature.h"
 #include "library/traktor/traktorfeature.h"
+#include "library/youtube/youtubefeature.h"
 #include "mixer/playermanager.h"
 #include "moc_library.cpp"
 #include "util/assert.h"
@@ -215,6 +216,11 @@ Library::Library(
     if (m_pConfig->getValue(
                 ConfigKey(kConfigGroup, "ShowSeratoLibrary"), true)) {
         addFeature(new SeratoFeature(this, m_pConfig));
+    }
+    if (YouTubeFeature::isSupported() &&
+            m_pConfig->getValue(
+                    ConfigKey(kConfigGroup, "ShowYouTubeLibrary"), true)) {
+        addFeature(new YouTubeFeature(this, m_pConfig));
     }
 
     for (const auto& externalTrackCollection : m_pTrackCollectionManager->externalCollections()) {
