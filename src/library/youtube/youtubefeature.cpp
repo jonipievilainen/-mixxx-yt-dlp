@@ -1,6 +1,7 @@
 #include "library/youtube/youtubefeature.h"
 
 #include <QDir>
+#include <QDebug>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -26,7 +27,9 @@
 
 namespace {
 
-constexpr int kSearchLimit = 10;
+constexpr int kMaxSearchResults = 10;
+constexpr int kSearchTimeoutMillis = 30000;
+constexpr int kDownloadTimeoutMillis = 15 * 60 * 1000;
 const QString kHomeViewName = QStringLiteral("YOUTUBEHOME");
 const QString kSidebarDownloadedData = QStringLiteral("downloaded");
 
@@ -231,7 +234,12 @@ void YouTubeFeature::downloadTrackById(const QString& videoId) {
         return;
     }
 
-    m_pLibrary->trackCollectionManager()->getOrAddTrack(TrackRef::fromFilePath(location));
+    const auto downloadedTrack =
+            m_pLibrary->trackCollectionManager()->getOrAddTrack(TrackRef::fromFilePath(location));
+    if (!downloadedTrack) {
+        renderSearchView(tr("Download completed, but Mixxx could not load the file."), true);
+        return;
+    }
     refreshDownloadedModel();
     renderSearchView(tr("Download complete: %1").arg(title));
 }
@@ -248,6 +256,8 @@ void YouTubeFeature::renderSearchView(const QString& message, bool isError) {
         while (downloadedQuery.next()) {
             downloadedIds.insert(downloadedQuery.value(0).toString());
         }
+    } else {
+        qWarning() << "Failed to query downloaded YouTube IDs";
     }
 
     QString html;
@@ -329,7 +339,7 @@ bool YouTubeFeature::runYtDlpSearch(const QString& query,
             QStringLiteral("--dump-json"),
             QStringLiteral("--skip-download"),
             QStringLiteral("--no-warnings"),
-            QStringLiteral("ytsearch%1:%2").arg(kSearchLimit).arg(query)};
+            QStringLiteral("ytsearch%1:%2").arg(kMaxSearchResults).arg(query)};
 
     process.start(executable, args);
     if (!process.waitForStarted()) {
@@ -338,7 +348,13 @@ bool YouTubeFeature::runYtDlpSearch(const QString& query,
         }
         return false;
     }
-    process.waitForFinished(-1);
+    if (!process.waitForFinished(kSearchTimeoutMillis)) {
+        process.kill();
+        if (pError) {
+            *pError = tr("yt-dlp search timed out.");
+        }
+        return false;
+    }
 
     const QString stdOut = QString::fromUtf8(process.readAllStandardOutput());
     const QString stdErr = QString::fromUtf8(process.readAllStandardError()).trimmed();
@@ -431,7 +447,13 @@ bool YouTubeFeature::runYtDlpDownload(const QString& sourceUrl,
         }
         return false;
     }
-    process.waitForFinished(-1);
+    if (!process.waitForFinished(kDownloadTimeoutMillis)) {
+        process.kill();
+        if (pError) {
+            *pError = tr("yt-dlp download timed out.");
+        }
+        return false;
+    }
 
     const QString stdOut = QString::fromUtf8(process.readAllStandardOutput());
     const QString stdErr = QString::fromUtf8(process.readAllStandardError()).trimmed();
@@ -528,7 +550,7 @@ bool YouTubeFeature::upsertDownloadedTrack(const QString& videoId,
     query.bindValue(QStringLiteral(":source_url"), sourceUrl);
     query.bindValue(QStringLiteral(":title"), title);
     query.bindValue(QStringLiteral(":artist"), uploader);
-    query.bindValue(QStringLiteral(":album"), tr("YouTube"));
+    query.bindValue(QStringLiteral(":album"), QStringLiteral("YouTube"));
     query.bindValue(QStringLiteral(":year"), QString());
     query.bindValue(QStringLiteral(":genre"), QString());
     query.bindValue(QStringLiteral(":tracknumber"), QString());
@@ -575,16 +597,20 @@ void YouTubeFeature::cleanupMissingDownloadedTracks() {
         return;
     }
 
-    QStringList idStrings;
-    idStrings.reserve(idsToDelete.size());
-    for (int id : std::as_const(idsToDelete)) {
-        idStrings.append(QString::number(id));
-    }
-
     QSqlQuery deleteQuery(db);
+    QStringList placeholders;
+    placeholders.reserve(idsToDelete.size());
+    for (int i = 0; i < idsToDelete.size(); ++i) {
+        placeholders.append(QStringLiteral("?"));
+    }
     deleteQuery.prepare(QStringLiteral("DELETE FROM youtube_library WHERE id IN (%1)")
-                                .arg(idStrings.join(QStringLiteral(","))));
-    deleteQuery.exec();
+                                .arg(placeholders.join(QStringLiteral(","))));
+    for (int id : std::as_const(idsToDelete)) {
+        deleteQuery.addBindValue(id);
+    }
+    if (!deleteQuery.exec()) {
+        qWarning() << "Failed to remove missing YouTube tracks from youtube_library";
+    }
 }
 
 void YouTubeFeature::refreshDownloadedModel() {
@@ -593,6 +619,8 @@ void YouTubeFeature::refreshDownloadedModel() {
 }
 
 QString YouTubeFeature::downloadDirectory() const {
+    // Prefer app-local storage for files managed by this feature. If unavailable,
+    // fall back to the user's music directory.
     QString baseDirectory = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     if (baseDirectory.isEmpty()) {
         baseDirectory = QStandardPaths::writableLocation(QStandardPaths::MusicLocation);
